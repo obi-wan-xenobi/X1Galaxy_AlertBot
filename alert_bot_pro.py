@@ -9,29 +9,21 @@ from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMar
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
 # --- CONFIGURATION ---
-# Replace with your actual Bot Token from @BotFather
 TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-# Replace with your actual Channel ID (starts with -100...)
 PUBLIC_CHANNEL_ID = "-1002361138833" 
 
-# File Paths
 DATA_FILE = "/var/www/app.x1galaxy.io/all_validator_data.json"
-TPS_FILE = "/var/www/app.x1galaxy.io/epoch_tps_stats.json"
 DB_FILE = "/root/xenobi_website/bot_users.db"
 
-# Settings & Thresholds
-WHALE_THRESHOLD = 50000   # Trigger whale alert if stake changes > 50k XNT
+WHALE_THRESHOLD = 50000 
 LAMPORTS = 1_000_000_000
-CACHE_TTL = 30            # Seconds to keep data in memory for commands
+CACHE_TTL = 30 
 FOOTER = "\n\n📊 <i>More data at <a href='https://x1galaxy.io'>x1galaxy.io</a></i>"
 
-# Global Cache Object
+# Global Cache
 _data_cache = {"timestamp": 0, "data": None}
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # --- DATABASE LOGIC ---
 def init_db():
@@ -45,6 +37,16 @@ def init_db():
     conn.commit()
     conn.close()
 
+def track_metric(identity):
+    """Increments search hits for a specific validator identity."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute("INSERT INTO metrics (identity, hits) VALUES (?, 1) ON CONFLICT(identity) DO UPDATE SET hits = hits + 1", (identity,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Metric Track Error: {e}")
+
 def get_net_state(key, default=None):
     conn = sqlite3.connect(DB_FILE)
     res = conn.execute("SELECT value FROM network_state WHERE key=?", (key,)).fetchone()
@@ -57,63 +59,42 @@ def set_net_state(key, value):
     conn.commit()
     conn.close()
 
-def track_metric(identity):
-    """Tracks how many times a validator is queried."""
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        conn.execute("INSERT INTO metrics (identity, hits) VALUES (?, 1) ON CONFLICT(identity) DO UPDATE SET hits = hits + 1", (identity,))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logging.error(f"Metrics Error: {e}")
-
 # --- DATA HELPERS ---
 def load_data(use_cache=True):
     global _data_cache
     curr_time = time.time()
-    
     if use_cache and _data_cache["data"] and (curr_time - _data_cache["timestamp"] < CACHE_TTL):
         return _data_cache["data"]
-
-    if not os.path.exists(DATA_FILE):
-        return {}
-
+    if not os.path.exists(DATA_FILE): return {}
     try:
         with open(DATA_FILE, 'r') as f:
             new_data = json.load(f)
-            if "validators" not in new_data:
-                raise ValueError("Malformed JSON")
-            _data_cache["data"] = new_data
-            _data_cache["timestamp"] = curr_time
+            _data_cache["data"], _data_cache["timestamp"] = new_data, curr_time
             return new_data
     except Exception as e:
-        logging.error(f"Data Load Error: {e}")
+        logging.error(f"Load Error: {e}")
         return _data_cache["data"] or {}
 
 def find_validator_smart(query, validators):
     query = query.strip().lower()
     if not query: return None, []
-    # 1. Exact ID
     for v in validators:
         if query == v.get('identity', '').lower(): return v, []
-    # 2. Exact Name
     for v in validators:
         if query == (v.get('name') or "").lower(): return v, []
-    # 3. Partial Name
     suggestions = [v for v in validators if query in (v.get('name') or "").lower()]
-    if len(suggestions) == 1:
-        return suggestions[0], []
+    if len(suggestions) == 1: return suggestions[0], []
     return None, suggestions
 
 def format_xnt(lamports):
-    if lamports is None: return "0"
-    return f"{int(lamports / LAMPORTS):,}"
+    return f"{int(lamports / LAMPORTS):,}" if lamports else "0"
 
 # --- BOT COMMANDS ---
 async def post_init(application):
     commands = [
         BotCommand("start", "Help & Instructions"),
         BotCommand("stats", "Snapshot: /stats <name/id>"),
+        BotCommand("trending", "Top 10 most searched nodes"),
         BotCommand("calc", "ROI: /calc <amount> <name>"),
         BotCommand("set_limit", "Alert Limit: /set_limit <num>"),
         BotCommand("all_nodes_rewards", "Rewards table (DM Only)"),
@@ -127,13 +108,14 @@ async def post_init(application):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🛰 <b>X1Galaxy Bot: Network Intelligence</b>\n\n"
-        "I provide real-time X1 validator stats and private performance alerts.\n\n"
-        "<b>Commands:</b>\n"
-        "• /stats <code>[name/id]</code> - Live card\n"
-        "• /calc <code>[qty] [name]</code> - ROI estimate\n"
-        "• /all_nodes_rewards - Last epoch list\n"
-        "• /subscribe - Get private pings\n\n"
-        "<i>Search is smart: partial names will show matching buttons.</i>" + FOOTER
+        "<b>Analytics:</b>\n"
+        "• /stats <code>[name/id]</code> - Live performance card\n"
+        "• /trending - Most popular validators right now\n"
+        "• /top - Network Stake Leaderboard\n\n"
+        "<b>Alerts:</b>\n"
+        "• /subscribe <code>[id]</code> - Get private DM pings\n"
+        "• /set_limit <code>[num]</code> - Custom skip threshold\n"
+        + FOOTER
     )
     await update.message.reply_text(text, parse_mode='HTML', disable_web_page_preview=True)
 
@@ -156,7 +138,9 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Validator not found.")
         return
 
+    # Track usage hit in DB
     track_metric(best_match['identity'])
+
     sorted_vals = sorted(validators, key=lambda x: x.get('activatedStake', 0), reverse=True)
     rank = next((i for i, val in enumerate(sorted_vals) if val['identity'] == best_match['identity']), 0) + 1
     balance = best_match.get('voteBalanceLamports', 0) / LAMPORTS
@@ -181,6 +165,26 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(text, parse_mode='HTML', disable_web_page_preview=True)
 
+async def trending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows top 10 validators by search volume."""
+    conn = sqlite3.connect(DB_FILE)
+    top_metrics = conn.execute("SELECT identity, hits FROM metrics ORDER BY hits DESC LIMIT 10").fetchall()
+    conn.close()
+
+    if not top_metrics:
+        await update.message.reply_text("No trending data yet. Start searching with /stats!")
+        return
+
+    data = load_data()
+    validators = {v['identity']: v for v in data.get('validators', [])}
+
+    text = "🔥 <b>Trending Validators (Most Searched)</b>\n\n"
+    for i, (identity, hits) in enumerate(top_metrics):
+        name = validators.get(identity, {}).get('name') or f"<code>{identity[:8]}</code>"
+        text += f"{i+1}. {name} — <b>{hits}</b> lookups\n"
+    
+    await update.message.reply_text(text + FOOTER, parse_mode='HTML', disable_web_page_preview=True)
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -194,26 +198,22 @@ async def calc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try: amount = float(context.args[0].replace(',', ''))
     except: await update.message.reply_text("❌ Invalid amount."); return
-    
     data = load_data()
     best_match, _ = find_validator_smart(" ".join(context.args[1:]), data.get('validators', []))
     if not best_match:
         await update.message.reply_text("❌ Validator not found."); return
-
     comm = best_match.get('commission', 10)
     est_apr = 0.07 * (1 - (comm/100))
-    epoch_yield = (amount * est_apr) / 182 
     text = (f"💰 <b>ROI Estimate: {best_match.get('name', 'Node')}</b>\n"
             f"Principle: {amount:,.0f} XNT\n"
             f"----------------------------------\n"
-            f"💎 <b>Per Epoch:</b> ~{epoch_yield:.4f} XNT\n"
-            f"📅 <b>Annual:</b> ~{(amount * est_apr):,.2f} XNT\n"
+            f"💎 <b>Per Epoch:</b> ~{(amount * est_apr / 182):.4f} XNT\n"
             f"📈 <b>Net APY:</b> {(est_apr * 100):.2f}%" + FOOTER)
     await update.message.reply_text(text, parse_mode='HTML', disable_web_page_preview=True)
 
 async def all_nodes_rewards_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != 'private':
-        await update.message.reply_text("⚠️ Command restricted to Private DM to prevent spam.", parse_mode='HTML')
+        await update.message.reply_text("⚠️ This command is restricted to Private DM.", parse_mode='HTML')
         return
     data = load_data()
     active_nodes = [v for v in data.get("validators", []) if v.get("status") == "Active"]
@@ -232,8 +232,7 @@ async def set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         limit = int(context.args[0])
         conn = sqlite3.connect(DB_FILE)
         conn.execute("UPDATE subscriptions SET skip_limit = ? WHERE user_id = ?", (limit, user_id))
-        conn.commit()
-        conn.close()
+        conn.commit(); conn.close()
         await update.message.reply_text(f"✅ Alert threshold set to <b>{limit} blocks</b>.", parse_mode='HTML')
     except: await update.message.reply_text("❌ Invalid number.")
 
@@ -247,7 +246,9 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    if not context.args: return
+    if not context.args:
+        await update.message.reply_text("Usage: /subscribe <identity>")
+        return
     identity = context.args[0]
     conn = sqlite3.connect(DB_FILE)
     conn.execute("INSERT OR IGNORE INTO subscriptions (user_id, identity, last_state) VALUES (?, ?, ?)", (user_id, identity, "{}"))
@@ -259,7 +260,7 @@ async def list_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     subs = conn.execute("SELECT identity FROM subscriptions WHERE user_id = ?", (user_id,)).fetchall()
     conn.close()
-    if not subs: await update.message.reply_text("No subscriptions."); return
+    if not subs: await update.message.reply_text("No active subscriptions."); return
     await update.message.reply_text("<b>Your Subscriptions:</b>\n" + "\n".join([f"• <code>{s[0]}</code>" for s in subs]), parse_mode='HTML')
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -272,12 +273,15 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- BACKGROUND ENGINE ---
 async def check_data_job(context: ContextTypes.DEFAULT_TYPE):
-    # Important: Background checker uses FRESH data (no cache)
     data = load_data(use_cache=False)
     if not data: return
     validators = {v['identity']: v for v in data.get('validators', [])}
-    
-    # 1. Whale Alerts (Public)
+    curr_epoch = 0
+    if validators:
+        sample = next(iter(validators.values()))
+        if sample.get('epochCreditsFull'): curr_epoch = sample['epochCreditsFull'][-1][0]
+
+    # Whale Alerts
     prev_stakes = json.loads(get_net_state("stake_map", "{}"))
     curr_stakes = {idn: v.get('activatedStake', 0) for idn, v in validators.items()}
     for idn, stake in curr_stakes.items():
@@ -285,38 +289,30 @@ async def check_data_job(context: ContextTypes.DEFAULT_TYPE):
             diff = (stake - prev_stakes[idn]) / LAMPORTS
             if abs(diff) >= WHALE_THRESHOLD:
                 name = validators[idn].get('name') or f"<code>{idn[:8]}</code>"
-                emoji = "🐋" if diff > 0 else "📉"
-                verb = "delegated to" if diff > 0 else "withdrawn from"
-                alert = f"{emoji} <b>WHALE:</b> {abs(diff):,.0f} XNT {verb} <b>{name}</b>!"
+                alert = f"{'🐋' if diff > 0 else '📉'} <b>WHALE:</b> {abs(diff):,.0f} XNT {'to' if diff > 0 else 'from'} <b>{name}</b>"
                 await context.bot.send_message(chat_id=PUBLIC_CHANNEL_ID, text=alert + FOOTER, parse_mode='HTML')
     set_net_state("stake_map", json.dumps(curr_stakes))
 
-    # 2. Epoch Alerts (Public)
-    if validators:
-        sample = next(iter(validators.values()))
-        if sample.get('epochCreditsFull'):
-            curr_ep = sample['epochCreditsFull'][-1][0]
-            last_ep = int(get_net_state("last_epoch", 0))
-            if curr_ep > last_ep and last_ep != 0:
-                msg = f"🎆 <b>NEW EPOCH: {curr_ep}</b>\n\nActive Stake: {format_xnt(data.get('active_stake', 0))} XNT"
-                await context.bot.send_message(chat_id=PUBLIC_CHANNEL_ID, text=msg + FOOTER, parse_mode='HTML')
-                set_net_state("last_epoch", curr_ep)
+    # Epoch Reports
+    last_ep = int(get_net_state("last_epoch", 0))
+    if curr_epoch > last_ep and last_ep != 0:
+        msg = f"🎆 <b>NEW EPOCH: {curr_epoch}</b>\n\nActive Stake: {format_xnt(data.get('active_stake', 0))} XNT"
+        await context.bot.send_message(chat_id=PUBLIC_CHANNEL_ID, text=msg + FOOTER, parse_mode='HTML')
+        set_net_state("last_epoch", curr_epoch)
 
-    # 3. Private Alerts
+    # User Pings
     conn = sqlite3.connect(DB_FILE)
     subscriptions = conn.execute("SELECT user_id, identity, last_state, skip_limit FROM subscriptions").fetchall()
     for user_id, identity, last_state_json, skip_limit in subscriptions:
         if identity not in validators: continue
         curr, prev = validators[identity], json.loads(last_state_json)
         curr_skips = curr.get('skipped_slots_1_epochs', 0)
-        curr_ep = curr['epochCreditsFull'][-1][0] if curr.get('epochCreditsFull') else 0
         pings = []
-        
         if prev.get('status') and curr['status'] != prev['status']: pings.append(f"🚦 Status: {curr['status']}")
         if prev.get('comm') is not None and curr['commission'] != prev['comm']: pings.append(f"⚖️ Comm: {prev['comm']}% ➡️ {curr['commission']}%")
         
         last_notified_skip = prev.get('notified_skip', 0)
-        if curr_ep > prev.get('epoch', 0): last_notified_skip = 0
+        if curr_epoch > prev.get('epoch', 0): last_notified_skip = 0
         if curr_skips >= skip_limit and curr_skips > last_notified_skip:
             pings.append(f"⚠️ High Skips: {curr_skips} blocks")
             last_notified_skip = curr_skips
@@ -324,8 +320,7 @@ async def check_data_job(context: ContextTypes.DEFAULT_TYPE):
         if pings:
             try: await context.bot.send_message(chat_id=user_id, text=f"🛰 <b>Alert: {curr.get('name', identity[:8])}</b>\n" + "\n".join(pings) + FOOTER, parse_mode='HTML')
             except: pass
-        
-        new_state = json.dumps({"status": curr['status'], "comm": curr['commission'], "notified_skip": last_notified_skip, "epoch": curr_ep})
+        new_state = json.dumps({"status": curr['status'], "comm": curr['commission'], "notified_skip": last_notified_skip, "epoch": curr_epoch})
         conn.execute("UPDATE subscriptions SET last_state = ? WHERE user_id = ? AND identity = ?", (new_state, user_id, identity))
     conn.commit(); conn.close()
 
@@ -334,9 +329,9 @@ if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("trending", trending_cmd))
     app.add_handler(CommandHandler("calc", calc_cmd))
     app.add_handler(CommandHandler("all_nodes_rewards", all_nodes_rewards_cmd))
-    app.add_handler(CommandHandler("set_limit", set_limit))
     app.add_handler(CommandHandler("top", top_cmd))
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("list", list_subs))
