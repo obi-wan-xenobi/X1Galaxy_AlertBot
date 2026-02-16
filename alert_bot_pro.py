@@ -8,25 +8,35 @@ from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # --- CONFIGURATION ---
+# Replace with your actual Bot Token from @BotFather
 TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-PUBLIC_CHANNEL_ID = "-1002361138833" # Your X1Galaxy_Alerts Channel
+# Replace with your actual Channel ID (e.g., -100...)
+PUBLIC_CHANNEL_ID = "-1002361138833" 
+
+# File Paths
 DATA_FILE = "/var/www/app.x1galaxy.io/all_validator_data.json"
 TPS_FILE = "/var/www/app.x1galaxy.io/epoch_tps_stats.json"
 DB_FILE = "/root/xenobi_website/bot_users.db"
 
-# Settings
-WHALE_THRESHOLD = 50000  # XNT change to trigger whale alert
+# Settings & Thresholds
+WHALE_THRESHOLD = 50000  # Trigger public alert if stake changes by > 50k XNT
 LAMPORTS = 1_000_000_000
 FOOTER = "\n\n📊 <i>More data at <a href='https://x1galaxy.io'>x1galaxy.io</a></i>"
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# Logging setup
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    level=logging.INFO
+)
 
 # --- DATABASE LOGIC ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    # Stores private user subscriptions
     c.execute('''CREATE TABLE IF NOT EXISTS subscriptions 
                  (user_id TEXT, identity TEXT, last_state TEXT, UNIQUE(user_id, identity))''')
+    # Stores network-wide state like last epoch and stake maps
     c.execute('''CREATE TABLE IF NOT EXISTS network_state (key TEXT PRIMARY KEY, value TEXT)''')
     conn.commit()
     conn.close()
@@ -48,18 +58,18 @@ def load_data():
     if not os.path.exists(DATA_FILE): return {}
     try:
         with open(DATA_FILE, 'r') as f: return json.load(f)
-    except: return {}
+    except Exception as e:
+        logging.error(f"Error loading JSON: {e}")
+        return {}
 
 def find_validator(query, validators):
+    """Smarter search: exact ID -> exact name -> partial name."""
     query = query.strip().lower()
     if not query: return None
-    # 1. Exact ID
     for v in validators:
         if query == v.get('identity', '').lower(): return v
-    # 2. Exact Name
     for v in validators:
         if query == (v.get('name') or "").lower(): return v
-    # 3. Partial Name
     for v in validators:
         if query in (v.get('name') or "").lower(): return v
     return None
@@ -67,38 +77,40 @@ def find_validator(query, validators):
 def format_xnt(lamports):
     return f"{int(lamports / LAMPORTS):,}"
 
-# --- BOT COMMANDS ---
+# --- BOT COMMAND HANDLERS ---
+
 async def post_init(application):
-    """Sets up the hamburger menu in Telegram UI."""
+    """Sets the hamburger menu commands in Telegram UI."""
     commands = [
-        BotCommand("start", "Help & Instructions"),
+        BotCommand("start", "Help & Menu"),
         BotCommand("stats", "Snapshot: /stats <name/id>"),
         BotCommand("calc", "ROI: /calc <amount> <name>"),
-        BotCommand("all_nodes_rewards", "Table: Rewards for last epoch"),
+        BotCommand("all_nodes_rewards", "Last Epoch Rewards Table (DM Only)"),
         BotCommand("top", "Stake Leaderboard"),
-        BotCommand("subscribe", "Get Private Alerts"),
-        BotCommand("list", "Your Subscriptions"),
-        BotCommand("unsubscribe", "Stop Alerts")
+        BotCommand("subscribe", "Get Private DM Alerts"),
+        BotCommand("list", "View your subscriptions"),
+        BotCommand("unsubscribe", "Stop receiving alerts")
     ]
     await application.bot.set_my_commands(commands)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🛰 <b>X1Galaxy Bot: Network Intelligence</b>\n\n"
-        "I provide real-time X1 validator stats and private alerts.\n\n"
-        "<b>Commands:</b>\n"
+        "I provide real-time X1 validator analytics and private performance alerts.\n\n"
+        "<b>Main Commands:</b>\n"
         "• /stats <code>[name/id]</code> - Live performance card\n"
         "• /calc <code>[qty] [name]</code> - Estimated ROI\n"
-        "• /all_nodes_rewards - Rewards table for last epoch\n"
-        "• /top - Network Stake Top 10\n"
-        "• /subscribe <code>[id]</code> - Get private DM alerts\n\n"
-        "<i>Alerts for status, commission, and rewards are sent privately.</i>" + FOOTER
+        "• /all_nodes_rewards - Rewards table (Private DM only)\n"
+        "• /top - Network Stake Top 10\n\n"
+        "<b>Alerts:</b>\n"
+        "Use /subscribe to get private DMs for status changes or reward distributions."
+        + FOOTER
     )
     await update.message.reply_text(text, parse_mode='HTML', disable_web_page_preview=True)
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❓ <b>Usage:</b> /stats <code>[name or identity]</code>", parse_mode='HTML')
+        await update.message.reply_text("❓ Usage: /stats <code>[name or identity]</code>", parse_mode='HTML')
         return
     
     data = load_data()
@@ -131,18 +143,23 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def calc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
-        await update.message.reply_text("❓ <b>Usage:</b> /calc [amount] [name]", parse_mode='HTML')
+        await update.message.reply_text("❓ Usage: /calc [amount] [name]", parse_mode='HTML')
         return
     
-    try: amount = float(context.args[0].replace(',', ''))
-    except: await update.message.reply_text("Invalid amount."); return
+    try: 
+        amount = float(context.args[0].replace(',', ''))
+    except: 
+        await update.message.reply_text("❌ Invalid amount.")
+        return
 
     data = load_data()
     v = find_validator(" ".join(context.args[1:]), data.get('validators', []))
-    if not v: await update.message.reply_text("Validator not found."); return
+    if not v:
+        await update.message.reply_text("❌ Validator not found.")
+        return
 
     comm = v.get('commission', 10)
-    est_apr = 0.07 * (1 - (comm/100))
+    est_apr = 0.07 * (1 - (comm/100)) # Estimated 7% base APR
     epoch_yield = (amount * est_apr) / 182 
     
     text = (
@@ -156,14 +173,21 @@ async def calc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode='HTML', disable_web_page_preview=True)
 
 async def all_nodes_rewards_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # SECURITY: Prevent group spam
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text(
+            "⚠️ <b>Large Data Block</b>\n\n"
+            "The rewards table is quite long. To avoid spamming this group, please use this command in a <b>private DM</b> with me.",
+            parse_mode='HTML'
+        )
+        return
+
     data = load_data()
     if not data:
         await update.message.reply_text("❌ Data unavailable.")
         return
 
-    # Filter: Only Active Nodes
     active_nodes = [v for v in data.get("validators", []) if v.get("status") == "Active"]
-    # Sort by Stake (Rank)
     active_nodes.sort(key=lambda x: x.get("activatedStake", 0), reverse=True)
 
     header = "🛰 <b>Last Epoch Rewards (Active Nodes)</b>\n"
@@ -181,7 +205,7 @@ async def all_nodes_rewards_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         row = f"<code>{str(rank).ljust(2)} | {str(round(rewards, 1)).rjust(5)} | {name.ljust(14)} | {short_id}</code>"
         rows.append(row)
 
-    # Split into chunks of 30 nodes to stay under Telegram char limits
+    # Chunking to handle 4096 char limit
     chunk_size = 30
     for i in range(0, len(rows), chunk_size):
         chunk = rows[i : i + chunk_size]
@@ -245,13 +269,14 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await update.message.reply_text(f"❌ Unsubscribed from alerts for <code>{identity}</code>", parse_mode='HTML')
 
-# --- THE ENGINE (Check Job) ---
+# --- BACKGROUND ENGINE (Whale Alerts / Epoch Reports / Pings) ---
+
 async def check_data_job(context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     if not data: return
     validators = {v['identity']: v for v in data.get('validators', [])}
     
-    # 1. WHALE WATCHER (Public Channel)
+    # 1. WHALE WATCHER (Public Channel Only)
     prev_stakes = json.loads(get_net_state("stake_map", "{}"))
     curr_stakes = {idn: v.get('activatedStake', 0) for idn, v in validators.items()}
     for idn, stake in curr_stakes.items():
@@ -265,7 +290,7 @@ async def check_data_job(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=PUBLIC_CHANNEL_ID, text=alert + FOOTER, parse_mode='HTML')
     set_net_state("stake_map", json.dumps(curr_stakes))
 
-    # 2. EPOCH REPORT
+    # 2. EPOCH REPORT (Public Channel Only)
     if validators:
         sample_v = next(iter(validators.values()))
         if sample_v.get('epochCreditsFull'):
@@ -276,7 +301,7 @@ async def check_data_job(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=PUBLIC_CHANNEL_ID, text=report + FOOTER, parse_mode='HTML')
                 set_net_state("last_epoch", curr_ep)
 
-    # 3. PRIVATE SUBSCRIPTION ALERTS
+    # 3. PRIVATE USER PINGS
     conn = sqlite3.connect(DB_FILE)
     subscriptions = conn.execute("SELECT user_id, identity, last_state FROM subscriptions").fetchall()
     for user_id, identity, last_state_json in subscriptions:
@@ -284,13 +309,19 @@ async def check_data_job(context: ContextTypes.DEFAULT_TYPE):
         curr, prev = validators[identity], json.loads(last_state_json)
         name = curr.get('name') or f"<code>{identity[:8]}</code>"
         pings = []
+        
         if prev.get('status') and curr['status'] != prev['status']:
             pings.append(f"Status changed to <b>{curr['status']}</b>")
         if prev.get('comm') is not None and curr['commission'] != prev['comm']:
             pings.append(f"Commission: {prev['comm']}% ➡️ {curr['commission']}%")
         
         if pings:
-            try: await context.bot.send_message(chat_id=user_id, text=f"🛰 <b>Alert: {name}</b>\n" + "\n".join(pings) + FOOTER, parse_mode='HTML')
+            try: 
+                await context.bot.send_message(
+                    chat_id=user_id, 
+                    text=f"🛰 <b>Alert: {name}</b>\n" + "\n".join(pings) + FOOTER, 
+                    parse_mode='HTML'
+                )
             except: pass
         
         new_state = json.dumps({"status": curr['status'], "comm": curr['commission']})
@@ -298,9 +329,12 @@ async def check_data_job(context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
 
+# --- RUN BOT ---
 if __name__ == '__main__':
     init_db()
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    
+    # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("calc", calc_cmd))
@@ -309,5 +343,9 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("list", list_subs))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
+    
+    # Run Background Checker every 3 mins
     app.job_queue.run_repeating(check_data_job, interval=180, first=10)
+    
+    # Start Polling
     app.run_polling()
