@@ -74,6 +74,7 @@ async def post_init(application):
         BotCommand("start", "Help & Instructions"),
         BotCommand("stats", "Snapshot: /stats <name/id>"),
         BotCommand("calc", "ROI: /calc <amount> <name>"),
+        BotCommand("all_nodes_rewards", "Table: Rewards for last epoch"),
         BotCommand("top", "Stake Leaderboard"),
         BotCommand("subscribe", "Get Private Alerts"),
         BotCommand("list", "Your Subscriptions"),
@@ -88,6 +89,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Commands:</b>\n"
         "• /stats <code>[name/id]</code> - Live performance card\n"
         "• /calc <code>[qty] [name]</code> - Estimated ROI\n"
+        "• /all_nodes_rewards - Rewards table for last epoch\n"
         "• /top - Network Stake Top 10\n"
         "• /subscribe <code>[id]</code> - Get private DM alerts\n\n"
         "<i>Alerts for status, commission, and rewards are sent privately.</i>" + FOOTER
@@ -152,6 +154,42 @@ async def calc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📈 <b>Net APY:</b> {(est_apr * 100):.2f}%" + FOOTER
     )
     await update.message.reply_text(text, parse_mode='HTML', disable_web_page_preview=True)
+
+async def all_nodes_rewards_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    if not data:
+        await update.message.reply_text("❌ Data unavailable.")
+        return
+
+    # Filter: Only Active Nodes
+    active_nodes = [v for v in data.get("validators", []) if v.get("status") == "Active"]
+    # Sort by Stake (Rank)
+    active_nodes.sort(key=lambda x: x.get("activatedStake", 0), reverse=True)
+
+    header = "🛰 <b>Last Epoch Rewards (Active Nodes)</b>\n"
+    header += "<code> # |  Rew  | Name           | ID    </code>\n"
+    header += "<code>---|-------|----------------|-------</code>\n"
+
+    rows = []
+    for i, v in enumerate(active_nodes):
+        rank = i + 1
+        rewards = v.get("rewards_last_1_epochs_xnt", 0)
+        name = v.get("name", "Unnamed")[:14]
+        identity = v.get("identity", "???")
+        short_id = f"{identity[:4]}..{identity[-2:]}"
+        
+        row = f"<code>{str(rank).ljust(2)} | {str(round(rewards, 1)).rjust(5)} | {name.ljust(14)} | {short_id}</code>"
+        rows.append(row)
+
+    # Split into chunks of 30 nodes to stay under Telegram char limits
+    chunk_size = 30
+    for i in range(0, len(rows), chunk_size):
+        chunk = rows[i : i + chunk_size]
+        msg = header if i == 0 else ""
+        msg += "\n".join(chunk)
+        if i + chunk_size >= len(rows): 
+            msg += FOOTER
+        await update.message.reply_text(msg, parse_mode='HTML', disable_web_page_preview=True)
 
 async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
@@ -266,6 +304,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("calc", calc_cmd))
+    app.add_handler(CommandHandler("all_nodes_rewards", all_nodes_rewards_cmd))
     app.add_handler(CommandHandler("top", top_cmd))
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("list", list_subs))
