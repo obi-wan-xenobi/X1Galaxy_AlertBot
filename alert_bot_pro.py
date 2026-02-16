@@ -6,7 +6,7 @@ from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # --- CONFIG ---
-TOKEN = "8481030243:AAF3GlpzdfkbJwFjwHIYhm0NXJiX67Q9Fhs"
+TOKEN = "Token here"
 PUBLIC_CHANNEL_ID = "-1003615505475"
 DATA_FILE = "/var/www/app.x1galaxy.io/all_validator_data.json"
 DB_FILE = "/root/xenobi_website/bot_users.db"
